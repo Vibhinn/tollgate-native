@@ -1,0 +1,141 @@
+name: Build llama-server
+
+# Triggered by pushing a tag like "llama-server-v1" (bump this tag any time
+# LLAMA_CPP_REF or the build flags below change, so releases stay traceable
+# to an exact, reproducible source commit) - or manually via workflow_dispatch
+# for testing before cutting a real tag.
+on:
+  push:
+    tags:
+      - "llama-server-v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # needed to attach release assets
+
+env:
+  # Pinned to the exact commit Tollgate has actually built and validated
+  # locally (health check, grammar-constrained generation, and real
+  # concurrent-request handling all confirmed against this commit) - bump
+  # deliberately, not to "whatever's newest," and re-validate before bumping.
+  LLAMA_CPP_REF: 81bc6b83f827df746eb129235488d325c49cae52
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14           # Apple Silicon (arm64) hosted runner
+            asset_name: llama-server-macos-arm64
+            archive_ext: tar.gz
+          - os: ubuntu-latest       # x86_64
+            asset_name: llama-server-linux-x86_64
+            archive_ext: tar.gz
+          - os: ubuntu-24.04-arm    # arm64 (e.g. Graviton-class) - verify this
+                                    # runner label is still current when you run this
+            asset_name: llama-server-linux-arm64
+            archive_ext: tar.gz
+          - os: windows-latest      # x86_64
+            asset_name: llama-server-windows-x86_64
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout llama.cpp at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: ggerganov/llama.cpp
+          ref: ${{ env.LLAMA_CPP_REF }}
+          path: llama.cpp
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git libcurl4-openssl-dev libssl-dev
+
+      # GGML_CPU_ALL_VARIANTS compiles one CPU kernel variant per known
+      # microarchitecture (see ggml/src/CMakeLists.txt for the full list per
+      # platform) and dispatches to the best match at runtime - this is what
+      # gives every user native-equivalent CPU performance from one shared
+      # build, without needing a compiler on their own machine. It requires
+      # GGML_BACKEND_DL (dynamic loading) and BUILD_SHARED_LIBS.
+      - name: Configure (macOS/Linux)
+        if: runner.os != 'Windows'
+        working-directory: llama.cpp
+        shell: bash
+        run: |
+          EXTRA_FLAGS=""
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            EXTRA_FLAGS="-DGGML_METAL=ON"
+          fi
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DLLAMA_CURL=OFF \
+            $EXTRA_FLAGS
+
+      - name: Build (macOS/Linux)
+        if: runner.os != 'Windows'
+        working-directory: llama.cpp
+        run: cmake --build build --config Release --target llama-server -j
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        working-directory: llama.cpp
+        shell: pwsh
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=ON `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DLLAMA_CURL=OFF
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        working-directory: llama.cpp
+        shell: pwsh
+        run: cmake --build build --config Release --target llama-server -j
+
+      # Everything the binary needs at runtime - the executable, the shared
+      # support libraries, and the dynamically-loaded per-CPU-variant plugins
+      # - gets copied flat into one directory and archived together, since
+      # they're expected to sit side by side (same convention Tollgate itself
+      # extracts them into: src/app/intelligence/server/).
+      - name: Package (macOS/Linux)
+        if: runner.os != 'Windows'
+        working-directory: llama.cpp
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/bin/llama-server dist/
+          cp build/bin/*.dylib dist/ 2>/dev/null || true
+          cp build/bin/*.so dist/ 2>/dev/null || true
+          chmod +x dist/llama-server
+          tar -czf ${{ matrix.asset_name }}.tar.gz -C dist .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        working-directory: llama.cpp
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item build\bin\Release\llama-server.exe dist\
+          Copy-Item build\bin\Release\*.dll dist\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path dist\* -DestinationPath ${{ matrix.asset_name }}.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: llama.cpp/${{ matrix.asset_name }}.${{ matrix.archive_ext }}
+          retention-days: 14
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: llama.cpp/${{ matrix.asset_name }}.${{ matrix.archive_ext }}
