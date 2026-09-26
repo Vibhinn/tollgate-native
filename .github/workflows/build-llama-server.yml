@@ -77,10 +77,16 @@ jobs:
             -DLLAMA_CURL=OFF \
             $EXTRA_FLAGS
 
+      # -j with no number means "unlimited parallel jobs" to GNU Make, not
+      # "use all cores sensibly" - combined with GGML_CPU_ALL_VARIANTS
+      # compiling ~13 separate memory-hungry CPU-kernel variants, that
+      # oversubscribed a standard runner's RAM and got a compiler process
+      # OOM-killed mid-build. Bounded to 2 to match the standard GitHub-
+      # hosted runner's actual core count.
       - name: Build (macOS/Linux)
         if: runner.os != 'Windows'
         working-directory: llama.cpp
-        run: cmake --build build --config Release --target llama-server -j
+        run: cmake --build build --config Release --target llama-server -j2
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
@@ -98,7 +104,7 @@ jobs:
         if: runner.os == 'Windows'
         working-directory: llama.cpp
         shell: pwsh
-        run: cmake --build build --config Release --target llama-server -j
+        run: cmake --build build --config Release --target llama-server -j2
 
       # Everything the binary needs at runtime - the executable, the shared
       # support libraries, and the dynamically-loaded per-CPU-variant plugins
