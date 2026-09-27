@@ -90,17 +90,37 @@ jobs:
         working-directory: llama.cpp
         shell: bash
         run: |
+          # -type f alone silently skips symlinks - and the SONAME symlink
+          # (e.g. libggml.so.0 -> libggml.so.0.25.3) is exactly what the
+          # binary's DT_NEEDED entries reference at runtime, not the fully
+          # versioned filename. -type l picks those up too; plain `cp`
+          # dereferences a symlink source into a real file at the
+          # destination, named after the symlink (the SONAME), which is
+          # exactly what the dynamic linker needs to find.
           mkdir -p dist
           cp build/bin/llama-server dist/
-          find build -type f \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -exec cp {} dist/ \;
+          find build \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -exec cp {} dist/ \;
           chmod +x dist/llama-server
           tar -czf ${{ matrix.asset_name }}.tar.gz -C dist .
 
+      # Testing dist/ in place isn't good enough: CMake bakes an absolute
+      # RPATH into binaries pointing back at their own build tree (so you can
+      # run them before "installing"), so a broken dist/ can still pass by
+      # silently resolving libs from build/bin instead - exactly what
+      # happened here once. Deleting build/ first and extracting the actual
+      # produced archive into a clean directory means this can only pass by
+      # dist/ genuinely being self-sufficient, the way a customer's machine
+      # actually needs it to be.
       - name: Smoke test binary (macOS/Linux)
         if: runner.os != 'Windows'
         working-directory: llama.cpp
         shell: bash
-        run: ./dist/llama-server --help > /dev/null
+        run: |
+          rm -rf build
+          mkdir -p smoke-test
+          tar -xzf ${{ matrix.asset_name }}.tar.gz -C smoke-test
+          chmod +x smoke-test/llama-server
+          ./smoke-test/llama-server --help > /dev/null
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -112,12 +132,17 @@ jobs:
           Get-ChildItem -Path build -Recurse -Filter *.dll | Copy-Item -Destination dist\ -Force
           Compress-Archive -Path dist\* -DestinationPath ${{ matrix.asset_name }}.zip
 
+      # Same rationale as the Linux/macOS smoke test: verify the actual
+      # archive from a clean extraction, not dist/ in place.
       - name: Smoke test binary (Windows)
         if: runner.os == 'Windows'
         working-directory: llama.cpp
         shell: pwsh
         run: |
-          & .\dist\llama-server.exe --help | Out-Null
+          Remove-Item -Recurse -Force build
+          New-Item -ItemType Directory -Path smoke-test -Force | Out-Null
+          Expand-Archive -Path "${{ matrix.asset_name }}.zip" -DestinationPath smoke-test
+          & .\smoke-test\llama-server.exe --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "llama-server.exe --help failed with exit code $LASTEXITCODE" }
 
       - name: Upload build artifact
